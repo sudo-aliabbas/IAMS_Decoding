@@ -1,142 +1,142 @@
-% Complete merged code: Build LDPC matrix, decode using IAMS, simulate BER
-clc; clear; close all;
+clc; clear;
 
-%% Step 1: Define Base Matrix (Example: BG2-like small matrix)
-base_matrix = [...
-    0 1 -1;
-    1 0 1
-];
+% === Load Base Graph 2 and expand H ===
+load('official_BG2_base_graph.mat');  % should contain BG2 (42 x 52)
+Z = 52;
+H = expandBaseGraph(BG2, Z);          % 2184 × 2704
+[M, N] = size(H);
+fprintf("Expanded H size: %d x %d\n", M, N);
 
-Z = 2; % Lifting size (small for example)
+% === All-zeros valid codeword
+codeword = zeros(N, 1);
 
-%% Step 2: Build Expanded H matrix and Layer Info
-[H_expanded, layers, col_degrees] = build_5G_LDPC(base_matrix, Z);
-[M, N] = size(H_expanded);
+% === Flip 1 bit to introduce a single-bit error
+error_pos = 1000;   % Flip bit #1000 (you can change this)
+corrupted = codeword;
+corrupted(error_pos) = 1;  % Bit-flip (0 → 1)
 
-%% Step 3: Simulation Parameters
-Imax = 100;           
-D = 2;               
-lambda = 0;          
-q = 4;               
-q_tilde = 5;        
-mu = 2;               
-SNR_dB = 2;           
-num_frames = 1;       
+% === Create LLR from corrupted word
+tx = 1 - 2 * corrupted;
+rx = tx + 0.3 * randn(size(tx));     % Simulate AWGN
+llr = 2 * rx;
+llr = max(min(round(llr), 31), -31);  % Quantize to 6-bit
 
-%% Step 4: Simulate One Frame
-snr_linear = 10^(SNR_dB/10);
-sigma = sqrt(1/(2*snr_linear));
+% === Decode using IAMS
+max_iter = 25;
+decoded = IAMSDecoder(llr, H, max_iter);
 
-% Assume all-zero codeword for simplicity
-%true_codeword = zeros(1,N);
-true_codeword = randi([0 1], 1, N);
+% === Compare
+fprintf("Flipped bit #%d\n", error_pos);
+disp("Decoded codeword (first 20 bits):"); disp(decoded(1:20)');
 
-% BPSK modulation: 0 -> +1, 1 -> -1
-tx_signal = 1 - 2 * true_codeword;
-
-% Transmit over AWGN
-rx_signal = tx_signal + sigma*randn(1, N);
-
-% Quantize received signal
-gamma = max(min(round(mu * rx_signal), 2^(q-1)-1), -(2^(q-1)-1))
-
-% Decode
-decoded_bits = IAMS_decoder_5G(gamma, H_expanded, layers, col_degrees, Imax, D, lambda, q, q_tilde);
-
-%% Step 5: Results
-disp('Transmitted Codeword:'); disp(true_codeword);
-disp('Received Signal:'); disp(rx_signal);
-disp('Decoded Bits:'); disp(decoded_bits);
-
-errors = sum(decoded_bits ~= true_codeword);
-fprintf('Number of bit errors: %d\n', errors);
-
-%% ---- Helper Functions ----
-function [H_expanded, layers, col_degrees] = build_5G_LDPC(base_matrix, Z)
-    [M_b, N_b] = size(base_matrix);
-    M = M_b * Z;
-    N = N_b * Z;
-    H_expanded = sparse(M, N);
-    for r = 1:M_b
-        for c = 1:N_b
-            shift = base_matrix(r,c);
-            if shift ~= -1
-                I_Z = speye(Z);
-                H_block = circshift(I_Z, [0, shift]);
-                H_expanded((r-1)*Z+1:r*Z, (c-1)*Z+1:c*Z) = H_block;
-            end
-        end
-    end
-    layers = cell(M_b,1);
-    for l = 1:M_b
-        layers{l} = (l-1)*Z + (1:Z);
-    end
-    col_degrees = sum(H_expanded ~= 0, 1);
+% === Check if decoder corrected the error
+if all(decoded == codeword)
+    disp("Decoder successfully corrected the 1-bit error.");
+elseif all(mod(H * decoded(:), 2) == 0)
+    disp("Decoding resulted in another valid codeword (but not original).");
+else
+    disp("Decoder failed to correct the error.");
 end
 
-function decoded_bits = IAMS_decoder_5G(gamma, H, layers, col_degrees, Imax, D, lambda, q, q_tilde)
-    [Nc, Nv] = size(H);
-    Q = 2^(q-1) - 1;
-    Q_tilde = 2^(q_tilde-1) - 1;
-    Gamma = -Q:Q;
-    A = -Q_tilde:Q_tilde;
 
-    alpha = zeros(Nc, Nv);
-    beta = zeros(Nv, Nc);
-    APP = gamma;
 
-    for t = 1:Imax
-        for l = 1:length(layers)
-            check_nodes = layers{l};
-            for m = check_nodes
-                connected_vars = find(H(m,:) ~= 0);
-                for n = connected_vars
-                    beta(n,m) = clip(round(APP(n) - alpha(m,n)), Gamma);
-                end
-                abs_betas = abs(beta(connected_vars,m));
-                signs = sign(beta(connected_vars,m));
-                [sorted_vals, idx] = sort(abs_betas);
-                min1 = sorted_vals(1);
-                min2 = sorted_vals(min(2,end));
-                sign_prod = prod(signs);
+function H = expandBaseGraph(BG, Z)
+    [m, n] = size(BG);
+    H = zeros(m*Z, n*Z);
 
-                for idx_var = 1:length(connected_vars)
-                    n = connected_vars(idx_var);
-                    if l <= 4 && col_degrees(n) >= D
-                        other_idx = setdiff(1:length(connected_vars), idx_var);
-                        if isempty(other_idx)
-                            min_other = 0;
-                        else
-                            min_other = min(abs_betas(other_idx));
-                        end
-                        temp = max(min_other - lambda, 0);
-                        alpha(m,n) = clip(sign_prod * temp, Gamma);
-                    else
-                        if connected_vars(idx(1)) == n
-                            selected_min = min2;
-                        else
-                            selected_min = min1;
-                        end
-                        alpha(m,n) = clip(sign_prod * selected_min, Gamma);
-                    end
-                end
-            end
-            % Update APPs after each layer
-            for m = check_nodes
-                connected_vars = find(H(m,:) ~= 0);
-                for n = connected_vars
-                    APP(n) = clip(round(gamma(n) + sum(alpha(find(H(:,n)),n))), A);
-                end
+    for i = 1:m
+        for j = 1:n
+            if BG(i,j) == -1
+                H((i-1)*Z+1:i*Z, (j-1)*Z+1:j*Z) = zeros(Z);
+            else
+                I = eye(Z);
+                H((i-1)*Z+1:i*Z, (j-1)*Z+1:j*Z) = circshift(I, [0 BG(i,j)]);
             end
         end
-        decoded_bits = double(APP < 0);
-        if all(mod(H * decoded_bits',2) == 0)
+    end
+end
+
+
+function decoded = IAMSDecoder(llr, H, max_iter)
+    [M, N] = size(H);
+    gamma = llr(:);
+    gamma_tilde = gamma;
+    alpha = sparse(M, N); beta = sparse(N, M);
+    lambda = 1; tau = 1;
+
+    % Build Tanner Graph + compute column degrees
+    CNs = cell(M,1); VNs = cell(N,1); col_deg = zeros(1,N);
+    for m = 1:M, CNs{m} = find(H(m,:) ~= 0); end
+    for n = 1:N
+        VNs{n} = find(H(:,n) ~= 0);
+        col_deg(n) = length(VNs{n});
+    end
+
+    % Scaling factor D(n)
+    D_scale = ones(1, N);
+    for n = 1:N
+        d = col_deg(n);
+        if d == 2
+            D_scale(n) = 0.9;
+        elseif d == 3
+            D_scale(n) = 0.85;
+        elseif d >= 4
+            D_scale(n) = 0.8;
+        end
+    end
+
+    % Column-degree adaptation threshold D = 6
+    D_thresh = 6;
+
+    for iter = 1:max_iter
+        for m = 1:M
+            nlist = CNs{m}; E = length(nlist);
+
+            % Step 1: VN → CN (beta)
+            for k = 1:E
+                n = nlist(k);
+                beta(n,m) = gamma_tilde(n) - alpha(m,n);
+            end
+
+            % Step 2: CN → VN (min-sum)
+            beta_vals = abs(beta(nlist, m));
+            signs = sign(prod(beta(nlist, m))) * sign(beta(nlist, m));
+            [min1, idx1] = min(beta_vals);
+            temp = beta_vals; temp(idx1) = inf;
+            [min2, idx2_safe] = min(temp);
+
+            for k = 1:E
+                n = nlist(k);
+
+                % Column-degree adaptation: skip update if deg ≥ D in early iterations
+                if iter < 4 && col_deg(n) >= D_thresh
+                    continue;  % Skip α(m,n) update
+                end
+
+                % Normal IAMS update with scaling
+                if k == idx1
+                    msg = tau * min2;
+                elseif k == idx2_safe
+                    msg = tau * min1;
+                elseif min1 == min2
+                    msg = tau * max(min1 - lambda, 0);
+                else
+                    msg = tau * min1;
+                end
+                alpha(m,n) = D_scale(n) * msg * signs(k);
+            end
+
+            % Step 3: APP update
+            for k = 1:E
+                n = nlist(k);
+                gamma_tilde(n) = beta(n,m) + alpha(m,n);
+            end
+        end
+
+        decoded = gamma_tilde < 0;
+        if all(mod(H * decoded(:), 2) == 0)
             return;
         end
     end
 end
 
-function y = clip(x, alphabet)
-    [~, idx] = min(abs(alphabet - x));
-    y = alphabet(idx);
-end
