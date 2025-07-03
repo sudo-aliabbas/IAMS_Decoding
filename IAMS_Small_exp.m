@@ -1,116 +1,97 @@
-% IAMS LDPC Decoder Simulation
 clc; clear;
 
-% Parameters
-q = 3;                   % Quantization bits
-Q = 2^(q-1)-1;           % Quantization range
-mu = 3;                  % Gain factor for quantization
-lambda = 0.8;            % Damping factor
-D = 2;                   % Degree threshold for adaptation
-Imax = 30;               % Max number of iterations
+% === 1. Small LDPC parity-check matrix (3x6)
+H = [
+    1 1 0 1 0 0;
+    0 1 1 0 1 0;
+    1 0 1 0 0 1
+];  % Defines a (6,3) code
 
-% Parity-check matrix (3x7)
-H = [1 0 1 0 1 0 1;
-     0 1 1 0 0 1 1;
-     0 0 0 1 1 1 1];
+% === 2. Known valid codeword (satisfies H * c = 0 mod 2)
+codeword = [1; 1; 0; 0; 1; 1];
+assert(all(mod(H * codeword, 2) == 0), "❌ Codeword is not valid under H");
 
-% Generator matrix consistent with H
-G = [1 0 0 0 1 1 0;
-     0 1 0 0 1 0 1;
-     0 0 1 0 0 1 1;
-     0 0 0 1 1 1 1];
+% === 3. Introduce a 1-bit error (flip bit 3 for example)
+error_pos = 3;
+corrupted = codeword;
+corrupted(error_pos) = ~corrupted(error_pos);  % flip 0 ↔ 1
 
-% Original message
-msg = [1 0 0 0];
-codeword = mod(msg * G, 2);
+fprintf("Flipping bit #%d: introducing 1-bit error...\n", error_pos);
+fprintf("Original : "); disp(codeword');
+fprintf("Corrupted: "); disp(corrupted');
 
-% BPSK Modulation: 0 -> +1, 1 -> -1
-mod_signal = 1 - 2 * codeword;
+% === 4. Convert to LLRs (simulate transmission)
+tx = 1 - 2 * corrupted;
+rx = tx + 0.3 * randn(size(tx));   % add some noise (moderate)
+llr = 2 * rx;                      % compute LLRs
 
-% Add Gaussian noise
-snr = 3;  % dB
-sigma = sqrt(1 / (2 * 10^(snr / 10)));
-rx_signal = mod_signal + sigma * randn(1, length(mod_signal));
+% === 5. Decode with IAMS
+decoded = IAMSDecoder(llr, H, 10);
 
-% Quantization
-gamma = max(min(round(mu * rx_signal), Q), -Q);
+% === 6. Check results
+disp("Decoded codeword:"); disp(decoded');
+disp("Syndrome (H * decoded mod 2):"); disp(mod(H * decoded(:), 2));
 
-% Decode using IAMS
-decoded = IAMS_decoder(gamma, H, Imax, D, lambda, q);
+if all(decoded == codeword)
+    disp("PASS: IAMS decoder correctly corrected the 1-bit error.");
+elseif all(mod(H * decoded(:), 2) == 0)
+    disp("Partial Pass: Syndrome is zero, but codeword doesn't match — decoder found a different valid codeword.");
+else
+    disp("FAIL: Decoder did not correct the error.");
+end
 
-% Show results
-disp("Original Message:"); disp(msg);
-disp("Transmitted Codeword:"); disp(codeword);
-disp("Received Signal (noisy):"); disp(rx_signal);
-disp("Decoded Codeword:"); disp(decoded);
 
-decoding_success = isequal(decoded, codeword);
-disp("Decoding Success:"); disp(decoding_success);
 
-% ----- Decoder Function -----
-function decoded = IAMS_decoder(gamma, H, Imax, D, lambda, q)
+function decoded = IAMSDecoder(llr, H, max_iter)
     [M, N] = size(H);
-    Q = 2^(q-1) - 1;
-    alpha = zeros(M, N);
-    beta = zeros(N, M);
+    gamma = llr(:);
     gamma_tilde = gamma;
+    alpha = sparse(M, N); 
+    beta = sparse(N, M);
+    lambda = 1; tau = 1;
 
-    % Build neighbors
-    N_m = cell(M,1);
-    M_n = cell(N,1);
-    for m = 1:M
-        N_m{m} = find(H(m,:) ~= 0);
-    end
-    for n = 1:N
-        M_n{n} = find(H(:,n) ~= 0)';
-    end
+    CNs = cell(M,1); VNs = cell(N,1);
+    for m = 1:M, CNs{m} = find(H(m,:) ~= 0); end
+    for n = 1:N, VNs{n} = find(H(:,n) ~= 0); end
 
-    for t = 1:Imax
-        for l = 1:M
-            m = l;
-            for n = N_m{m}
-                set_n = setdiff(N_m{m}, n);
-                signs = prod(sign(gamma_tilde(set_n)));
-                abs_vals = abs(gamma_tilde(set_n));
-                if isempty(abs_vals)
-                    min1 = 0; min2 = 0; idx1 = -1;
-                else
-                    [sorted_vals, sorted_idx] = sort(abs_vals);
-                    min1 = sorted_vals(1);
-                    idx1 = set_n(sorted_idx(1));
-                    if length(sorted_vals) > 1
-                        min2 = sorted_vals(2);
-                        idx2 = set_n(sorted_idx(2));
-                    else
-                        min2 = min1;
-                        idx2 = idx1;
-                    end
-                end
-                beta(n, m) = signs * min1;
+    for iter = 1:max_iter
+        for m = 1:M
+            nlist = CNs{m}; E = length(nlist);
+            for k = 1:E
+                n = nlist(k);
+                beta(n,m) = gamma_tilde(n) - alpha(m,n);
             end
 
-            for n = N_m{m}
-                dv = length(M_n{n});
-                if l <= 4 && dv >= D
-                    other_nodes = setdiff(N_m{m}, n);
-                    abs_vals = abs(beta(other_nodes, m));
-                    min_val = min(abs_vals);
-                    val = max(min_val - lambda, 0);
-                    alpha(m, n) = H(m,n) * sign(prod(sign(beta(other_nodes, m)))) * val;
+            beta_vals = abs(beta(nlist, m));
+            signs = sign(prod(beta(nlist, m))) * sign(beta(nlist, m));
+            [min1, idx1] = min(beta_vals);
+            temp = beta_vals; temp(idx1) = inf;
+            [min2, idx2_safe] = min(temp);
+
+            for k = 1:E
+                n = nlist(k);
+                if k == idx1
+                    msg = tau * min2;
+                elseif k == idx2_safe
+                    msg = tau * min1;
+                elseif min1 == min2
+                    msg = tau * max(min1 - lambda, 0);
                 else
-                    if n == idx1
-                        val = min2;
-                    else
-                        val = min1;
-                    end
-                    alpha(m, n) = H(m,n) * sign(prod(sign(beta(setdiff(N_m{m}, n), m)))) * val;
+                    msg = tau * min1;
                 end
-                gamma_tilde(n) = gamma(n) + sum(alpha(M_n{n}, n));
+                alpha(m,n) = msg * signs(k);
+            end
+
+            for k = 1:E
+                n = nlist(k);
+                gamma_tilde(n) = beta(n,m) + alpha(m,n);
             end
         end
-        decoded = double(gamma_tilde < 0);
-        if all(mod(H * decoded', 2) == 0)
+
+        decoded = gamma_tilde < 0;
+        if all(mod(H * decoded(:), 2) == 0)
             return;
         end
     end
 end
+
